@@ -1,0 +1,26 @@
+# Env / secrets
+.env
+.env.local
+.env.*.local
+
+# Dependencies
+node_modules/
+
+# Build artifacts
+openclaw/dist/
+openclaw/ui/dist/
+openclaw/packages/*/dist/
+
+# Runtime state
+.moss-data/
+openclaw-data/
+*.pid
+*.sock
+__pycache__/
+*.pyc
+
+# Editor / OS
+.DS_Store
+.vscode/
+.idea/
+*.egg-info/

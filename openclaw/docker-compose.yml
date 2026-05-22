@@ -1,0 +1,42 @@
+services:
+  openclaw-gateway:
+    image: ${MOSS_IMAGE:-openclaw:local}
+    environment:
+      HOME: /home/node
+      TERM: xterm-256color
+      MOSS_GATEWAY_TOKEN: ${MOSS_GATEWAY_TOKEN}
+      MOSS_MODEL_API_KEY: ${MOSS_MODEL_API_KEY}
+    volumes:
+      - ${OPENCLAW_CONFIG_DIR}:/home/node/.openclaw
+      - ${OPENCLAW_WORKSPACE_DIR}:/home/node/.openclaw/workspace
+    ports:
+      - "${OPENCLAW_GATEWAY_PORT:-19789}:18789"
+      - "${OPENCLAW_BRIDGE_PORT:-19790}:18790"
+    init: true
+    restart: unless-stopped
+    command:
+      [
+        "node",
+        "dist/index.js",
+        "gateway",
+        "--bind",
+        "${OPENCLAW_GATEWAY_BIND:-lan}",
+        "--port",
+        "18789",
+      ]
+
+  openclaw-cli:
+    image: ${MOSS_IMAGE:-openclaw:local}
+    environment:
+      HOME: /home/node
+      TERM: xterm-256color
+      MOSS_GATEWAY_TOKEN: ${MOSS_GATEWAY_TOKEN}
+      MOSS_MODEL_API_KEY: ${MOSS_MODEL_API_KEY}
+      BROWSER: echo
+    volumes:
+      - ${OPENCLAW_CONFIG_DIR}:/home/node/.openclaw
+      - ${OPENCLAW_WORKSPACE_DIR}:/home/node/.openclaw/workspace
+    stdin_open: true
+    tty: true
+    init: true
+    entrypoint: ["node", "dist/index.js"]

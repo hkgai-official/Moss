@@ -1,0 +1,44 @@
+services:
+  moss-gateway:
+    image: ${MOSS_IMAGE:-moss:baseline}
+    # First run only: `docker compose up` builds moss:baseline from
+    # ./openclaw if the tag doesn't exist locally. Once built, reused.
+    # Force a fresh build with `docker compose build --no-cache`.
+    build:
+      context: ./openclaw
+      dockerfile: Dockerfile
+    container_name: moss-gateway
+    user: "1001:1001"
+    ports:
+      - "19799:18789"
+    environment:
+      HOME: /home/node
+      MOSS_GATEWAY_TOKEN: ${MOSS_GATEWAY_TOKEN:-}
+      MOSS_HOOKS_TOKEN: ${MOSS_HOOKS_TOKEN:-}
+      MOSS_MODEL_API_KEY: ${MOSS_MODEL_API_KEY:-}
+      MOSS_MODEL_BASE_URL: ${MOSS_MODEL_BASE_URL:-}
+      MOSS_MODEL_ID: ${MOSS_MODEL_ID:-}
+      MOSS_DATA_DIR: ${MOSS_DATA_DIR:-}
+      MOSS_OPENCLAW_REPO_DIR: ${MOSS_OPENCLAW_REPO_DIR:-}
+      MOSS_H_PRE: ${MOSS_H_PRE:-}
+      # Container path is fixed; host side is ${MOSS_DAEMON_SOCK} (see
+      # volume mount below). Decoupling lets users move the host socket
+      # without touching container-side code or this file.
+      MOSS_DAEMON_SOCK: /run/moss.sock
+      OPENCLAW_GATEWAY_URL: http://localhost:18789
+      # Pin the gateway WebSocket port. OpenClaw's CLI port resolution has a
+      # quirk where `node openclaw.mjs gateway --bind lan --allow-unconfigured`
+      # can bind to a non-default port even when openclaw.json sets
+      # gateway.port (config-layer fix is silently bypassed in some paths).
+      # OPENCLAW_GATEWAY_PORT is the highest-priority resolver and always
+      # wins. Keep this in sync with the container side of the port mapping
+      # below. See KNOWN_ISSUES.md for context.
+      OPENCLAW_GATEWAY_PORT: "18789"
+    volumes:
+      - ${MOSS_DATA_DIR}:/home/node/.openclaw
+      - ${MOSS_DAEMON_SOCK}:/run/moss.sock
+      - ${MOSS_HOST_ROOT}/openclaw/src:/app/src:ro
+      - ${MOSS_HOST_ROOT}/openclaw/dist:/app/dist:ro
+      - ${MOSS_HOST_ROOT}/host-daemon/src/cli/moss:/usr/local/bin/moss:ro
+    command: ["node", "openclaw.mjs", "gateway", "--bind", "lan", "--allow-unconfigured"]
+    restart: "no"

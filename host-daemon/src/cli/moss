@@ -1,0 +1,405 @@
+#!/usr/bin/env python3
+"""moss — MOSS self-evolution control CLI.
+
+Two protocols:
+  - HTTP to OpenClaw gateway (evolution control: status / batches / batch /
+    start / stop / apply)
+  - Unix socket to host-daemon (auto-scan: flag / catch-up)
+
+Output: stdout = result (human or JSON). stderr = events + errors.
+Exit code: 0 success, non-zero failure.
+"""
+import argparse
+import json
+import os
+import socket
+import sys
+import uuid
+from urllib import request, error as urlerror
+from typing import Any, Iterator
+
+DEFAULT_SOCK = "/run/moss.sock"
+DEFAULT_GATEWAY = "http://localhost:18789"
+
+
+# --------------------------------------------------------------------------
+# HTTP client
+# --------------------------------------------------------------------------
+class HttpError(Exception):
+    pass
+
+
+def _gateway_url() -> str:
+    return os.environ.get("OPENCLAW_GATEWAY_URL", DEFAULT_GATEWAY)
+
+
+def _token() -> str:
+    return os.environ.get("MOSS_GATEWAY_TOKEN", "")
+
+
+def _http(method: str, path: str, body: dict | None = None) -> dict:
+    url = f"{_gateway_url()}{path}"
+    headers = {"Content-Type": "application/json"}
+    token = _token()
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+    data = json.dumps(body).encode() if body is not None else None
+    req = request.Request(url, data=data, headers=headers, method=method)
+    try:
+        with request.urlopen(req, timeout=60) as resp:
+            raw = resp.read().decode()
+            if not raw:
+                return {}
+            return json.loads(raw)
+    except urlerror.HTTPError as e:
+        try:
+            err_body = e.read().decode()
+        except Exception:
+            err_body = ""
+        raise HttpError(f"gateway returned HTTP {e.code}: {err_body[:200]}")
+    except urlerror.URLError as e:
+        raise HttpError(f"cannot reach gateway at {url}: {e.reason}")
+
+
+def http_get(path: str) -> dict:
+    return _http("GET", path)
+
+
+def http_post(path: str, body: dict) -> dict:
+    return _http("POST", path, body)
+
+
+# --------------------------------------------------------------------------
+# Socket client (mirrors openclaw/src/evolution/rpc-client.ts)
+# --------------------------------------------------------------------------
+class RpcError(Exception):
+    pass
+
+
+def _sock_path() -> str:
+    return os.environ.get("MOSS_DAEMON_SOCK", DEFAULT_SOCK)
+
+
+def rpc_stream(op: str, payload: dict) -> Iterator[dict]:
+    """Open socket, send one request, yield event/result/error messages until terminal.
+
+    Mirrors the protocol of rpc-client.ts: stream of {id, type, data} JSON lines,
+    terminal is type='result' or type='error'.
+    """
+    req_id = uuid.uuid4().hex
+    sock_path = _sock_path()
+    try:
+        sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        sock.connect(sock_path)
+    except (FileNotFoundError, ConnectionRefusedError, OSError) as e:
+        raise RpcError(f"cannot reach moss daemon at {sock_path}: {e}")
+
+    try:
+        sock.sendall((json.dumps({"id": req_id, "op": op, "payload": payload}) + "\n").encode())
+        buf = b""
+        while True:
+            chunk = sock.recv(4096)
+            if not chunk:
+                # Socket closed without terminal
+                raise RpcError("connection closed unexpectedly")
+            buf += chunk
+            while b"\n" in buf:
+                line, buf = buf.split(b"\n", 1)
+                if not line.strip():
+                    continue
+                try:
+                    msg = json.loads(line.decode())
+                except json.JSONDecodeError:
+                    continue
+                yield msg
+                if msg.get("type") in ("result", "error"):
+                    return
+    finally:
+        sock.close()
+
+
+def rpc_call(op: str, payload: dict, on_event=None) -> dict:
+    """Drain rpc_stream, dispatch event callbacks, return result data, raise on error."""
+    for msg in rpc_stream(op, payload):
+        mtype = msg.get("type")
+        if mtype == "event":
+            if on_event:
+                on_event(msg.get("data", {}))
+        elif mtype == "result":
+            return msg.get("data", {})
+        elif mtype == "error":
+            raise RpcError(msg.get("data", {}).get("message", "unknown RPC error"))
+    raise RpcError("RPC stream ended without terminal")
+
+
+# --------------------------------------------------------------------------
+# Subcommand handlers — see evolution.md for behavior
+# --------------------------------------------------------------------------
+
+def cmd_status(args):
+    data = http_get("/api/evolution/active")
+    if args.json:
+        print(json.dumps(data))
+        return
+    # Format: one-liner
+    if not data or data.get("batch_id") is None:
+        print("idle | no active evolution")
+        return
+    parts = [f"running"]
+    if data.get("batch_id"):
+        parts.append(f"batch={data['batch_id']}")
+    if data.get("stage"):
+        parts.append(f"stage={data['stage']}")
+    if data.get("iter") is not None:
+        parts.append(f"iter={data['iter']}")
+    print(" | ".join(parts))
+
+
+def cmd_batches(args):
+    data = http_get("/api/evolution/batches")
+    if args.json:
+        print(json.dumps(data))
+        return
+    batches = data.get("batches", []) if isinstance(data, dict) else data
+    if not batches:
+        print("(no batches)")
+        return
+    print(f"{'ID':40} {'SIZE':>6} {'STATE':16} CREATED")
+    for b in batches:
+        bid = b.get("id") or b.get("batch_id") or "?"
+        size = b.get("size", b.get("flag_count", 0))
+        state = b.get("apply_state") or b.get("status") or "?"
+        created = b.get("created_at", "?")
+        print(f"{bid[:40]:40} {size:>6} {str(state)[:16]:16} {created}")
+
+
+def cmd_batch(args):
+    raw = http_get(f"/api/evolution/batches?id={args.batch_id}")
+    if args.json:
+        print(json.dumps(raw))
+        return
+    # Gateway may return a list (filtered) or a single dict
+    if isinstance(raw, list):
+        data = raw[0] if raw else None
+    else:
+        data = raw or None
+    if not data:
+        print(f"batch {args.batch_id} not found")
+        sys.exit(1)
+    bid = data.get("batch_id", data.get("id", args.batch_id))
+    size = data.get("flag_count", data.get("size", "?"))
+    print(f"Batch {bid}")
+    print(f"  size: {size}")
+    print(f"  status: {data.get('status', '?')}")
+    print(f"  apply_state: {data.get('apply_state', '?')}")
+    chunks = data.get("chunks", [])
+    if chunks:
+        print(f"  chunks ({len(chunks)}):")
+        for c in chunks:
+            src = c.get("source", {})
+            print(f"    - seq={c.get('seq', '?')} agent={src.get('agent_id', '?')} "
+                  f"session={src.get('session_id', '?')} "
+                  f"cursor={src.get('cursor_start', '?')}→{src.get('cursor_end', '?')}")
+
+
+def cmd_start(args):
+    batch_id = args.batch_id
+    if not batch_id:
+        # Auto-select: pick the latest non-empty batch by scanning batches list.
+        batches_data = http_get("/api/evolution/batches")
+        batches = batches_data.get("batches", []) if isinstance(batches_data, dict) else batches_data
+        candidates = [b for b in batches if (b.get("size") or b.get("flag_count") or 0) > 0]
+        if not candidates:
+            if args.json:
+                print(json.dumps({"error": "no non-empty batch found"}))
+            else:
+                print("error | no non-empty batch found", file=sys.stderr)
+            sys.exit(1)
+        # Prefer the latest by created_at (or by order, which is typically newest-last).
+        batch_id = candidates[-1].get("id") or candidates[-1].get("batch_id", "")
+        if not batch_id:
+            if args.json:
+                print(json.dumps({"error": "could not resolve batch id"}))
+            else:
+                print("error | could not resolve batch id", file=sys.stderr)
+            sys.exit(1)
+    body = {"batch_id": batch_id}
+    if getattr(args, "depth", None):
+        body["depth"] = args.depth
+    data = http_post("/api/evolution/trigger", body)
+    if args.json:
+        print(json.dumps(data))
+        return
+    if data.get("error"):
+        print(f"error | {data['error']}", file=sys.stderr)
+        sys.exit(1)
+    bid = data.get("manifest_id", args.batch_id or "?")
+    print(f"ok | started batch={bid}")
+
+
+def cmd_stop(args):
+    # Resolve the active batch_id first; stop is a no-op when nothing is running.
+    active = http_get("/api/evolution/active")
+    batch_id = active.get("batch_id") if active else None
+    if not batch_id:
+        if args.json:
+            print(json.dumps({"stopped": False, "reason": "nothing running"}))
+        else:
+            print("ok | nothing running")
+        return
+    data = http_post("/api/evolution/stop", {"batch_id": batch_id})
+    if args.json:
+        print(json.dumps(data))
+        return
+    if data.get("error"):
+        print(f"error | {data['error']}", file=sys.stderr)
+        sys.exit(1)
+    print(f"ok | stop signal sent for batch={batch_id}")
+
+
+def cmd_restart(args):
+    """Restart a previously-stopped (apply_state=failed) batch.
+
+    Archives the previous run's evidence under archive/<oldTriggerId>/ and
+    re-triggers a fresh evolution. Note: the loop architecture is v0
+    fresh-start-only — completed iters from the prior run are NOT reused
+    (true iter-level resume is tracked for v2.7). Use this when you stopped
+    a run and want to start over from scratch with the same batch.
+    """
+    body = {"batch_id": args.batch_id}
+    data = http_post("/api/evolution/restart", body)
+    if args.json:
+        print(json.dumps(data))
+        return
+    if data.get("error"):
+        print(f"error | {data['error']}", file=sys.stderr)
+        if data.get("hint"):
+            print(f"        hint: {data['hint']}", file=sys.stderr)
+        sys.exit(1)
+    bid = data.get("manifest_id", args.batch_id)
+    prev = data.get("archived_previous_trigger")
+    if prev:
+        print(f"ok | restarted batch={bid} (archived prev trigger={prev[:8]}…)")
+    else:
+        print(f"ok | restarted batch={bid}")
+
+
+def cmd_apply(args):
+    data = http_post("/api/evolution/apply", {"batch_id": args.batch_id})
+    if args.json:
+        print(json.dumps(data))
+        return
+    if data.get("error"):
+        print(f"error | {data['error']}", file=sys.stderr)
+        sys.exit(1)
+    print(f"ok | swap-req written for batch={args.batch_id}")
+
+
+def cmd_flag(args):
+    data_dir = os.environ.get("MOSS_DATA_DIR", "")
+    source_path = os.path.join(data_dir, "agents", args.agent, "sessions", f"{args.session}.jsonl")
+    result = rpc_call("auto-scan-session", {"source_path": source_path})
+    if args.json:
+        print(json.dumps(result))
+        return
+    added = result.get("chunks_added", 0)
+    bid = result.get("batch_id", "?")
+    print(f"ok | scanned session={args.session} chunks={added} → batch={bid}")
+
+
+def cmd_catch_up(args):
+    events = []
+    def on_event(data):
+        events.append(data)
+    result = rpc_call("auto-scan-catch-up", {}, on_event=on_event)
+    if args.json:
+        print(json.dumps(result))
+        return
+    added = result.get("total_chunks_added", result.get("chunks_added", 0))
+    touched = result.get("batches_touched", [])
+    print(f"ok | catch-up complete: chunks_added={added} batches_touched={len(touched)}")
+
+
+# --------------------------------------------------------------------------
+# Main
+# --------------------------------------------------------------------------
+
+def _add_json_flag(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument("--json", action="store_true", help="Output JSON instead of human text")
+
+
+def build_parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(prog="moss", description="MOSS self-evolution control")
+    _add_json_flag(p)  # accept at top level: `moss --json evo status`
+    sub = p.add_subparsers(dest="group", required=True)
+    evo = sub.add_parser("evo", help="Evolution control")
+    evo_sub = evo.add_subparsers(dest="cmd", required=True)
+
+    # Also accept --json after each subcommand: `moss evo status --json`.
+    # argparse forgets the parent value when a subcommand parses its own args,
+    # so we have to re-declare on every subcommand parser and OR the values in main().
+    for name in ("status", "batches", "stop", "catch-up"):
+        sp = evo_sub.add_parser(name)
+        _add_json_flag(sp)
+        sp.set_defaults(func={
+            "status": cmd_status,
+            "batches": cmd_batches,
+            "stop": cmd_stop,
+            "catch-up": cmd_catch_up,
+        }[name])
+
+    bp = evo_sub.add_parser("batch")
+    bp.add_argument("batch_id")
+    _add_json_flag(bp)
+    bp.set_defaults(func=cmd_batch)
+
+    sp = evo_sub.add_parser("start")
+    sp.add_argument("batch_id", nargs="?", default=None)
+    sp.add_argument(
+        "--depth",
+        choices=["shallow", "standard", "deep"],
+        default=None,
+        help="Evolution depth tier (default: batch's own depth, usually standard)",
+    )
+    _add_json_flag(sp)
+    sp.set_defaults(func=cmd_start)
+
+    ap = evo_sub.add_parser("apply")
+    ap.add_argument("batch_id")
+    _add_json_flag(ap)
+    ap.set_defaults(func=cmd_apply)
+
+    rp = evo_sub.add_parser("restart", help="Re-trigger a stopped batch (prior run archived)")
+    rp.add_argument("batch_id")
+    _add_json_flag(rp)
+    rp.set_defaults(func=cmd_restart)
+
+    fp = evo_sub.add_parser("flag")
+    fp.add_argument("--agent", required=True)
+    fp.add_argument("--session", required=True)
+    _add_json_flag(fp)
+    fp.set_defaults(func=cmd_flag)
+
+    return p
+
+
+def main():
+    raw_argv = sys.argv[1:]
+    args = build_parser().parse_args()
+    # --json can appear before or after the subcommand; argparse's subparser
+    # would otherwise reset the top-level value to False on the subcommand path.
+    if "--json" in raw_argv and not args.json:
+        args.json = True
+    try:
+        args.func(args)
+        sys.exit(0)
+    except HttpError as e:
+        print(f"error: {e}", file=sys.stderr)
+        sys.exit(1)
+    except RpcError as e:
+        print(f"error: {e}", file=sys.stderr)
+        sys.exit(1)
+
+
+if __name__ == "__main__":
+    main()

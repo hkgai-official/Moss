@@ -1,0 +1,25 @@
+MOSS
+Copyright 2026 HKGAI
+
+This product is licensed under the Apache License, Version 2.0 (the "License").
+You may obtain a copy of the License at http://www.apache.org/licenses/LICENSE-2.0
+
+----------------------------------------------------------------------
+
+This product includes software developed by third parties, under the
+following licenses:
+
+OpenClaw (https://github.com/openclaw/openclaw)
+  Copyright (c) 2025 Peter Steinberger
+  Licensed under the MIT License.
+  See openclaw/LICENSE for the full text.
+  All code under the openclaw/ directory is vendored from this project
+  and remains under its original MIT license.
+
+a2ui specification and renderers (vendored under openclaw/vendor/a2ui/)
+  Various licenses (ISC, Apache-2.0) — see individual package LICENSE
+  files under openclaw/vendor/a2ui/.
+
+Other Node.js, Python, and OS-level dependencies are listed in their
+respective package manifests (openclaw/package.json, host-daemon/pyproject.toml)
+and retain their original licenses.

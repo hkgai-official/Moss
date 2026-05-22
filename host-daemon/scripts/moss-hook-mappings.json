@@ -1,0 +1,28 @@
+{
+  "hooks": {
+    "enabled": true,
+    "mappings": [
+      {
+        "id": "moss-evo-converged",
+        "match": { "path": "evolution-converged" },
+        "action": "agent",
+        "wakeMode": "now",
+        "messageTemplate": "{{payload.payload.human_summary}}\n\nTo apply, run: `moss evo apply {{payload.payload.batch_id}}`."
+      },
+      {
+        "id": "moss-evo-failed",
+        "match": { "path": "evolution-failed" },
+        "action": "agent",
+        "wakeMode": "now",
+        "messageTemplate": "{{payload.payload.human_summary}}\n\nLog: {{payload.payload.log_path}}."
+      },
+      {
+        "id": "moss-apply-complete",
+        "match": { "path": "apply-complete" },
+        "action": "agent",
+        "wakeMode": "now",
+        "messageTemplate": "{{payload.payload.human_summary}}"
+      }
+    ]
+  }
+}
